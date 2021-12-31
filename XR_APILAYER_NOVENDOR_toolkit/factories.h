@@ -46,6 +46,18 @@ namespace toolkit {
                                                    ID3D11Texture2D* texture,
                                                    const std::optional<std::string>& debugName);
 
+        std::shared_ptr<IDevice> WrapD3D12Device(ID3D12Device* device, ID3D12CommandQueue* queue);
+        std::shared_ptr<ITexture> WrapD3D12Texture(std::shared_ptr<IDevice> device,
+                                                   const XrSwapchainCreateInfo& info,
+                                                   ID3D12Resource* texture,
+                                                   const std::optional<std::string>& debugName);
+
+        std::shared_ptr<IDevice> CreateD3D11on12Device(ID3D12Device* device, ID3D12CommandQueue* queue);
+        std::shared_ptr<ITexture> WrapD3D11on12Texture(std::shared_ptr<IDevice> device,
+                                                       const XrSwapchainCreateInfo& info,
+                                                       ID3D12Resource* texture,
+                                                       const std::optional<std::string>& debugName);
+
         std::pair<uint32_t, uint32_t>
         GetNISScaledResolution(std::shared_ptr<toolkit::config::IConfigManager> configManager,
                                uint32_t outputWidth,

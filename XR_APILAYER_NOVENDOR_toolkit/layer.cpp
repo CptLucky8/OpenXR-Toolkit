@@ -45,6 +45,7 @@ namespace {
 
     struct SwapchainImages {
         std::vector<std::shared_ptr<graphics::ITexture>> chain;
+        std::shared_ptr<graphics::ITexture> textureForMenu;
 
         std::shared_ptr<graphics::IGpuTimer> upscalerGpuTimer[ViewCount];
         std::shared_ptr<graphics::IGpuTimer> preProcessorGpuTimer[ViewCount];
@@ -173,7 +174,14 @@ namespace {
                     if (entry->type == XR_TYPE_GRAPHICS_BINDING_D3D11_KHR) {
                         const XrGraphicsBindingD3D11KHR* d3dBindings =
                             reinterpret_cast<const XrGraphicsBindingD3D11KHR*>(entry);
-                        m_graphicsDevice = graphics::WrapD3D11Device(d3dBindings->device);
+                        m_graphicsDevice = m_graphicsDeviceForMenu = graphics::WrapD3D11Device(d3dBindings->device);
+                        break;
+                    } else if (entry->type == XR_TYPE_GRAPHICS_BINDING_D3D12_KHR) {
+                        const XrGraphicsBindingD3D12KHR* d3dBindings =
+                            reinterpret_cast<const XrGraphicsBindingD3D12KHR*>(entry);
+                        m_graphicsDevice = graphics::WrapD3D12Device(d3dBindings->device, d3dBindings->queue);
+                        m_graphicsDeviceForMenu =
+                            graphics::CreateD3D11on12Device(d3dBindings->device, d3dBindings->queue);
                         break;
                     }
 
@@ -207,12 +215,12 @@ namespace {
 
                     for (unsigned int i = 0; i <= GpuTimerLatency; i++) {
                         m_performanceCounters.appGpuTimer[i] = m_graphicsDevice->createTimer();
-                        m_performanceCounters.overlayGpuTimer[i] = m_graphicsDevice->createTimer();
+                        m_performanceCounters.overlayGpuTimer[i] = m_graphicsDeviceForMenu->createTimer();
                     }
 
                     m_performanceCounters.lastWindowStart = std::chrono::steady_clock::now();
 
-                    m_menuHandler = menu::CreateMenuHandler(m_configManager, m_graphicsDevice);
+                    m_menuHandler = menu::CreateMenuHandler(m_configManager, m_graphicsDeviceForMenu);
                 } else {
                     Log("Unsupported graphics runtime.\n");
                 }
@@ -229,6 +237,7 @@ namespace {
             if (XR_SUCCEEDED(result) && isVrSession(session)) {
                 m_swapchains.clear();
                 m_menuHandler.reset();
+                m_graphicsDeviceForMenu.reset();
                 m_graphicsDevice.reset();
                 m_vrSession = XR_NULL_HANDLE;
             }
@@ -293,83 +302,113 @@ namespace {
                         SwapchainImages images;
 
                         // Store the runtime images into the state (last entry in the processing chain).
+                        auto texture = graphics::WrapD3D11Texture(m_graphicsDevice,
+                                                                  chainCreateInfo,
+                                                                  d3dImages[i].texture,
+                                                                  fmt::format("Runtime swapchain {} TEX2D", i));
+                        images.chain.push_back(texture);
+                        images.textureForMenu = texture;
+                    }
+                } else if (m_graphicsDevice->getApi() == graphics::Api::D3D12) {
+                    std::vector<XrSwapchainImageD3D12KHR> d3dImages(imageCount, {XR_TYPE_SWAPCHAIN_IMAGE_D3D12_KHR});
+                    CHECK_XRCMD(OpenXrApi::xrEnumerateSwapchainImages(
+                        *swapchain,
+                        imageCount,
+                        &imageCount,
+                        reinterpret_cast<XrSwapchainImageBaseHeader*>(d3dImages.data())));
+                    for (uint32_t i = 0; i < imageCount; i++) {
+                        SwapchainImages images;
+
+                        // Store the runtime images into the state (last entry in the processing chain).
                         images.chain.push_back(
-                            graphics::WrapD3D11Texture(m_graphicsDevice,
+                            graphics::WrapD3D12Texture(m_graphicsDevice,
                                                        chainCreateInfo,
                                                        d3dImages[i].texture,
                                                        fmt::format("Runtime swapchain {} TEX2D", i)));
 
-                        // TODO: Create other entries in the chain based on the processing to do (scaling,
-                        // post-processing...).
-
-                        if (m_preProcessor) {
-                            // Create an intermediate texture with the same resolution as the input.
-                            XrSwapchainCreateInfo inputCreateInfo = *createInfo;
-                            inputCreateInfo.usageFlags |= XR_SWAPCHAIN_USAGE_SAMPLED_BIT;
-                            if (m_upscaler) {
-                                // The upscaler requires to use as a shader input.
-                                inputCreateInfo.usageFlags |= XR_SWAPCHAIN_USAGE_SAMPLED_BIT;
-                            }
-
-                            auto inputTexture = m_graphicsDevice->createTexture(
-                                inputCreateInfo, fmt::format("Postprocess input swapchain {} TEX2D", i));
-
-                            // We place the texture at the very front (app texture).
-                            images.chain.insert(images.chain.begin(), inputTexture);
-
-                            images.preProcessorGpuTimer[0] = m_graphicsDevice->createTimer();
-                            if (createInfo->arraySize > 1) {
-                                images.preProcessorGpuTimer[1] = m_graphicsDevice->createTimer();
-                            }
-                        }
-
-                        if (m_upscaler) {
-                            // Create an app texture with the lower resolution.
-                            XrSwapchainCreateInfo inputCreateInfo = *createInfo;
-                            inputCreateInfo.usageFlags |= XR_SWAPCHAIN_USAGE_SAMPLED_BIT;
-                            auto inputTexture = m_graphicsDevice->createTexture(
-                                inputCreateInfo, fmt::format("App swapchain {} TEX2D", i));
-
-                            // We place the texture before the runtime texture, which means at the very front (app
-                            // texture) or after the pre-processor.
-                            images.chain.insert(images.chain.end() - 1, inputTexture);
-
-                            images.upscalerGpuTimer[0] = m_graphicsDevice->createTimer();
-                            if (createInfo->arraySize > 1) {
-                                images.upscalerGpuTimer[1] = m_graphicsDevice->createTimer();
-                            }
-                        }
-
-                        if (m_postProcessor) {
-                            // Create an intermediate texture with the same resolution as the output.
-                            XrSwapchainCreateInfo intermediateCreateInfo = chainCreateInfo;
-                            intermediateCreateInfo.usageFlags |= XR_SWAPCHAIN_USAGE_SAMPLED_BIT;
-                            if (m_upscaler) {
-                                // The upscaler requires to use as an unordered access view.
-                                intermediateCreateInfo.usageFlags |= XR_SWAPCHAIN_USAGE_UNORDERED_ACCESS_BIT;
-
-                                // This also means we need a non-sRGB type.
-                                if (m_graphicsDevice->isTextureFormatSRGB(intermediateCreateInfo.format)) {
-                                    intermediateCreateInfo.format =
-                                        m_graphicsDevice->getTextureFormat(graphics::TextureFormat::R16G16B16A16_UNORM);
-                                }
-                            }
-                            auto intermediateTexture = m_graphicsDevice->createTexture(
-                                intermediateCreateInfo, fmt::format("Postprocess input swapchain {} TEX2D", i));
-
-                            // We place the texture just before the runtime texture.
-                            images.chain.insert(images.chain.end() - 1, intermediateTexture);
-
-                            images.postProcessorGpuTimer[0] = m_graphicsDevice->createTimer();
-                            if (createInfo->arraySize > 1) {
-                                images.postProcessorGpuTimer[1] = m_graphicsDevice->createTimer();
-                            }
-                        }
+                        // Create the interop texture for rendering the menu.
+                        images.textureForMenu =
+                            graphics::WrapD3D11on12Texture(m_graphicsDeviceForMenu,
+                                                           chainCreateInfo,
+                                                           d3dImages[i].texture,
+                                                           fmt::format("Runtime swapchain {} 11on12 TEX2D", i));
 
                         swapchainState.images.push_back(images);
                     }
+
                 } else {
                     throw new std::runtime_error("Unsupported graphics runtime");
+                }
+
+                for (uint32_t i = 0; i < imageCount; i++) {
+                    SwapchainImages images = swapchainState.images[i];
+
+                    // TODO: Create other entries in the chain based on the processing to do (scaling,
+                    // post-processing...).
+
+                    if (m_preProcessor) {
+                        // Create an intermediate texture with the same resolution as the input.
+                        XrSwapchainCreateInfo inputCreateInfo = *createInfo;
+                        inputCreateInfo.usageFlags |= XR_SWAPCHAIN_USAGE_SAMPLED_BIT;
+                        if (m_upscaler) {
+                            // The upscaler requires to use as a shader input.
+                            inputCreateInfo.usageFlags |= XR_SWAPCHAIN_USAGE_SAMPLED_BIT;
+                        }
+
+                        auto inputTexture = m_graphicsDevice->createTexture(
+                            inputCreateInfo, fmt::format("Postprocess input swapchain {} TEX2D", i));
+
+                        // We place the texture at the very front (app texture).
+                        images.chain.insert(images.chain.begin(), inputTexture);
+
+                        images.preProcessorGpuTimer[0] = m_graphicsDevice->createTimer();
+                        if (createInfo->arraySize > 1) {
+                            images.preProcessorGpuTimer[1] = m_graphicsDevice->createTimer();
+                        }
+                    }
+
+                    if (m_upscaler) {
+                        // Create an app texture with the lower resolution.
+                        XrSwapchainCreateInfo inputCreateInfo = *createInfo;
+                        inputCreateInfo.usageFlags |= XR_SWAPCHAIN_USAGE_SAMPLED_BIT;
+                        auto inputTexture =
+                            m_graphicsDevice->createTexture(inputCreateInfo, fmt::format("App swapchain {} TEX2D", i));
+
+                        // We place the texture before the runtime texture, which means at the very front (app
+                        // texture) or after the pre-processor.
+                        images.chain.insert(images.chain.end() - 1, inputTexture);
+
+                        images.upscalerGpuTimer[0] = m_graphicsDevice->createTimer();
+                        if (createInfo->arraySize > 1) {
+                            images.upscalerGpuTimer[1] = m_graphicsDevice->createTimer();
+                        }
+                    }
+
+                    if (m_postProcessor) {
+                        // Create an intermediate texture with the same resolution as the output.
+                        XrSwapchainCreateInfo intermediateCreateInfo = chainCreateInfo;
+                        intermediateCreateInfo.usageFlags |= XR_SWAPCHAIN_USAGE_SAMPLED_BIT;
+                        if (m_upscaler) {
+                            // The upscaler requires to use as an unordered access view.
+                            intermediateCreateInfo.usageFlags |= XR_SWAPCHAIN_USAGE_UNORDERED_ACCESS_BIT;
+
+                            // This also means we need a non-sRGB type.
+                            if (m_graphicsDevice->isTextureFormatSRGB(intermediateCreateInfo.format)) {
+                                intermediateCreateInfo.format =
+                                    m_graphicsDevice->getTextureFormat(graphics::TextureFormat::R16G16B16A16_UNORM);
+                            }
+                        }
+                        auto intermediateTexture = m_graphicsDevice->createTexture(
+                            intermediateCreateInfo, fmt::format("Postprocess input swapchain {} TEX2D", i));
+
+                        // We place the texture just before the runtime texture.
+                        images.chain.insert(images.chain.end() - 1, intermediateTexture);
+
+                        images.postProcessorGpuTimer[0] = m_graphicsDevice->createTimer();
+                        if (createInfo->arraySize > 1) {
+                            images.postProcessorGpuTimer[1] = m_graphicsDevice->createTimer();
+                        }
+                    }
                 }
 
                 m_swapchains.insert_or_assign(*swapchain, swapchainState);
@@ -403,6 +442,11 @@ namespace {
                         XrSwapchainImageD3D11KHR* d3dImages = reinterpret_cast<XrSwapchainImageD3D11KHR*>(images);
                         for (uint32_t i = 0; i < *imageCountOutput; i++) {
                             d3dImages[i].texture = swapchainState.images[i].chain[0]->getNative<graphics::D3D11>();
+                        }
+                    } else if (m_graphicsDevice->getApi() == graphics::Api::D3D12) {
+                        XrSwapchainImageD3D12KHR* d3dImages = reinterpret_cast<XrSwapchainImageD3D12KHR*>(images);
+                        for (uint32_t i = 0; i < *imageCountOutput; i++) {
+                            d3dImages[i].texture = swapchainState.images[i].chain[0]->getNative<graphics::D3D12>();
                         }
                     } else {
                         throw new std::runtime_error("Unsupported graphics runtime");
@@ -569,7 +613,7 @@ namespace {
             // Unbind all textures from the render targets.
             m_graphicsDevice->clearRenderTargets();
 
-            std::shared_ptr<graphics::ITexture> topLayer[ViewCount] = {};
+            std::shared_ptr<graphics::ITexture> textureForMenu[ViewCount] = {};
 
             // Because the frame info is passed const, we are going to need to reconstruct a writable version of it to
             // patch the resolution.
@@ -669,7 +713,7 @@ namespace {
                             throw new std::runtime_error("Processing chain incomplete!");
                         }
 
-                        topLayer[eye] = swapchainImages.chain[nextImage];
+                        textureForMenu[eye] = swapchainImages.textureForMenu;
 
                         // Patch the resolution.
                         correctedProjectionViews[eye].subImage.imageRect.extent.width = m_displayWidth;
@@ -707,15 +751,15 @@ namespace {
                 m_stats.overlayGpuTimeUs +=
                     m_performanceCounters.overlayGpuTimer[m_performanceCounters.gpuTimerIndex]->query();
 
-                if (topLayer[0]) {
+                if (textureForMenu[0]) {
                     // When using VPRT, we rely on the menu renderer to render both views at once. Otherwise we
                     // render each view one at a time.
                     m_performanceCounters.overlayCpuTimer->start();
                     m_performanceCounters.overlayGpuTimer[m_performanceCounters.gpuTimerIndex]->start();
-                    m_menuHandler->render(topLayer[0]);
+                    m_menuHandler->render(textureForMenu[0]);
                     static_assert(ViewCount == 2);
-                    if (topLayer[1] != topLayer[0]) {
-                        m_menuHandler->render(topLayer[1]);
+                    if (textureForMenu[1] != textureForMenu[0]) {
+                        m_menuHandler->render(textureForMenu[1]);
                     }
                     m_performanceCounters.overlayCpuTimer->stop();
                     m_performanceCounters.overlayGpuTimer[m_performanceCounters.gpuTimerIndex]->stop();
@@ -744,6 +788,7 @@ namespace {
         std::shared_ptr<config::IConfigManager> m_configManager;
 
         std::shared_ptr<graphics::IDevice> m_graphicsDevice;
+        std::shared_ptr<graphics::IDevice> m_graphicsDeviceForMenu;
         std::map<XrSwapchain, SwapchainState> m_swapchains;
 
         std::shared_ptr<graphics::IUpscaler> m_upscaler;

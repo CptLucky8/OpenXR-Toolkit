@@ -37,6 +37,7 @@ namespace toolkit {
     };
 
     namespace {
+
         // A generic timer.
         struct ITimer {
             virtual ~ITimer() = default;
@@ -46,13 +47,15 @@ namespace toolkit {
 
             virtual uint64_t query(bool reset = true) const = 0;
         };
+
     } // namespace
 
     namespace utilities {
+
         // A CPU synchronous timer.
-        struct ICpuTimer : public ITimer {
-        };
-    }
+        struct ICpuTimer : public ITimer {};
+
+    } // namespace utilities
 
     namespace config {
 
@@ -103,7 +106,7 @@ namespace toolkit {
 
     namespace graphics {
 
-        enum class Api { D3D11 };
+        enum class Api { D3D11, D3D12 };
 
         // Type traits for D3D11.
         struct D3D11 {
@@ -118,6 +121,21 @@ namespace toolkit {
             using ShaderInputView = ID3D11ShaderResourceView*;
             using ComputeShaderOutputView = ID3D11UnorderedAccessView*;
             using RenderTargetView = ID3D11RenderTargetView*;
+        };
+
+        // Type traits for D3D12.
+        struct D3D12 {
+            static constexpr Api Api = Api::D3D12;
+
+            using Device = ID3D12Device*;
+            using Context = ID3D12CommandList*;
+            using Texture = ID3D12Resource*;
+            using Buffer = ID3D12Resource*;
+            using PixelShader = ID3D12PipelineState*;
+            using ComputeShader = ID3D12PipelineState*;
+            using ShaderInputView = D3D12_CPU_DESCRIPTOR_HANDLE*;
+            using ComputeShaderOutputView = D3D12_CPU_DESCRIPTOR_HANDLE*;
+            using RenderTargetView = D3D12_CPU_DESCRIPTOR_HANDLE*;
         };
 
         // A few handy texture formats.
